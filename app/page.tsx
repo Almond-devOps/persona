@@ -1,0 +1,518 @@
+'use client';
+
+import { useState, useCallback, useRef, useEffect } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import MicButton from '@/components/MicButton';
+import ModeToggle from '@/components/ModeToggle';
+import FileUpload from '@/components/FileUpload';
+import ScorecardOverlay from '@/components/ScorecardOverlay';
+import TranscriptPanel from '@/components/TranscriptPanel';
+import ConceptTracker from '@/components/ConceptTracker';
+import HistoryPanel from '@/components/HistoryPanel';
+import LiveSubtitle from '@/components/LiveSubtitle';
+import { teachItMode } from '@/lib/modes/teachIt';
+import { quizzerMode } from '@/lib/modes/quizzer';
+import { sendMessage } from '@/lib/chatEngine';
+import { scoreSession } from '@/lib/scoringEngine';
+import { startListening, stopListening, speak, cancelSpeaking } from '@/lib/speechEngine';
+import type { AppState, Message, ModeId, SavedSession } from '@/types';
+
+const MODES = { 'teach-it': teachItMode, 'quizzer': quizzerMode };
+
+// Regex to extract [COVERED: concept_name] and [SHAKY: concept_name] tags from AI replies
+const COVERED_REGEX = /\[COVERED:\s*([^\]]+)\]/gi;
+const SHAKY_REGEX = /\[SHAKY:\s*([^\]]+)\]/gi;
+
+const initialState: AppState = {
+  mode: 'teach-it',
+  micState: 'idle',
+  material: '',
+  concepts: [],
+  coveredConcepts: [],
+  shakyConcepts: [],
+  messages: [],
+  scoreCard: null,
+  sessionActive: false,
+  isUploading: false,
+  uploadedFileName: '',
+  error: null,
+};
+
+export default function PersonaApp() {
+  const [state, setState] = useState<AppState>(initialState);
+  const [showTranscript, setShowTranscript] = useState(false);
+  const [isScoringLoading, setIsScoringLoading] = useState(false);
+  const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [viewingFromHistory, setViewingFromHistory] = useState(false);
+  const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
+  
+  const stateRef = useRef(state);
+  stateRef.current = state;
+
+  // Load history on mount
+  useEffect(() => {
+    const raw = localStorage.getItem('persona_sessions');
+    if (raw) {
+      try {
+        setSavedSessions(JSON.parse(raw));
+      } catch (e) {
+        console.error('Failed to parse saved sessions', e);
+      }
+    }
+  }, []);
+
+  const setMicState = (micState: AppState['micState']) =>
+    setState((s) => ({ ...s, micState }));
+
+  const setError = (error: string | null) =>
+    setState((s) => ({ ...s, error }));
+
+  const handleDeleteSession = useCallback((id: string) => {
+    setSavedSessions((prev) => {
+      const updated = prev.filter((s) => s.id !== id);
+      localStorage.setItem('persona_sessions', JSON.stringify(updated));
+      return updated;
+    });
+  }, []);
+
+  const handleSelectSession = useCallback((session: SavedSession) => {
+    setState((s) => ({ ...s, scoreCard: session.scoreCard }));
+    setViewingFromHistory(true);
+    setShowHistory(false);
+  }, []);
+
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    setMousePos({ x: e.clientX, y: e.clientY });
+  }, []);
+
+  // ── Auto-resume listening after each AI turn ──────────────────────────────
+  const resumeListening = useCallback((prefix: string = '') => {
+    if (!stateRef.current.sessionActive) return;
+    setMicState('listening');
+    startListening(
+      (transcript) => processTranscript(transcript),
+      (errMsg) => {
+        if (errMsg.includes('No speech detected')) {
+          resumeListening(); // silently retry
+        } else {
+          setError(errMsg);
+          setMicState('idle');
+        }
+      },
+      prefix
+    );
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Mode change ────────────────────────────────────────────────────────────
+  const handleModeChange = useCallback((mode: ModeId) => {
+    stopListening();
+    cancelSpeaking();
+    setState({ ...initialState, mode });
+  }, []);
+
+  // ── File upload + concept extraction ──────────────────────────────────────
+  const handleFileExtracted = useCallback(async (text: string, fileName: string) => {
+    if (!text) {
+      setState((s) => ({ ...s, material: '', uploadedFileName: '', concepts: [], coveredConcepts: [] }));
+      return;
+    }
+    setState((s) => ({ ...s, material: text, uploadedFileName: fileName, isUploading: true, concepts: [], coveredConcepts: [] }));
+    try {
+      const res = await fetch('/api/extract-concepts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error?.message || data.error || 'Failed to extract concepts');
+      }
+      setState((s) => ({ ...s, concepts: data.concepts ?? [], isUploading: false }));
+    } catch (err: any) {
+      setState((s) => ({ ...s, isUploading: false }));
+      setError(err?.message || 'Failed to extract concepts. Check your Groq API key.');
+    }
+  }, []);
+
+  // ── Process transcript → LLM → parse coverage → speak → loop ─────────────
+  const processTranscript = useCallback(async (transcript: string) => {
+    // Filter out empty strings and common Whisper silence hallucinations (e.g. ".", "...", "!?")
+    const textOnly = transcript.replace(/[.,!?\s]/g, '');
+    if (textOnly.length === 0) {
+      resumeListening();
+      return;
+    }
+
+    const { mode, material, concepts, messages } = stateRef.current;
+    const modeConfig = MODES[mode];
+
+    setMicState('thinking');
+    setError(null);
+
+    try {
+      const userMsg: Message = { role: 'user', content: transcript, timestamp: Date.now() };
+      const updatedHistory = [...messages, userMsg];
+      setState((s) => ({ ...s, messages: updatedHistory }));
+
+      const systemPrompt = modeConfig.buildSystemPrompt(material, concepts);
+      const rawReply = await sendMessage(updatedHistory, systemPrompt);
+
+      // If the user clicked "End Session" while we were waiting for the LLM to reply, abort.
+      if (!stateRef.current.sessionActive) return;
+
+      // ── Parse [COVERED: concept] tags from AI reply ──────────────────────
+      const newlyCovered: string[] = [];
+      let matchCovered;
+      const regexCovered = new RegExp(COVERED_REGEX.source, 'gi');
+      while ((matchCovered = regexCovered.exec(rawReply)) !== null) {
+        newlyCovered.push(matchCovered[1].trim());
+      }
+
+      // ── Parse [SHAKY: concept] tags from AI reply ────────────────────────
+      const newlyShaky: string[] = [];
+      let matchShaky;
+      const regexShaky = new RegExp(SHAKY_REGEX.source, 'gi');
+      while ((matchShaky = regexShaky.exec(rawReply)) !== null) {
+        newlyShaky.push(matchShaky[1].trim());
+      }
+
+      // Strip tags from displayed/spoken text
+      const cleanReply = rawReply
+        .replace(COVERED_REGEX, '')
+        .replace(SHAKY_REGEX, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+
+      const aiMsg: Message = { role: 'assistant', content: cleanReply, timestamp: Date.now() };
+      
+      setState((s) => {
+        // Fuzzy match newly detected concepts against tracked concepts
+        const matchedCovered = concepts.filter((c) =>
+          newlyCovered.some((n) => c.toLowerCase() === n.toLowerCase() || c.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(c.toLowerCase()))
+        );
+        const matchedShaky = concepts.filter((c) =>
+          newlyShaky.some((n) => c.toLowerCase() === n.toLowerCase() || c.toLowerCase().includes(n.toLowerCase()) || n.toLowerCase().includes(c.toLowerCase()))
+        );
+
+        return {
+          ...s,
+          messages: [...updatedHistory, aiMsg],
+          coveredConcepts: [...new Set([...s.coveredConcepts, ...matchedCovered])],
+          shakyConcepts: [...new Set([...s.shakyConcepts, ...matchedShaky])],
+        };
+      });
+
+      setMicState('speaking');
+      await speak(
+        cleanReply,
+        () => resumeListening(),   // onEnd — auto-resume
+        (interruptText) => resumeListening(interruptText) // onInterrupt — barge-in → resume with captured words
+      );
+    } catch (err) {
+      console.error(err);
+      setError(err instanceof Error ? err.message : 'Something went wrong. Listening again...');
+      setTimeout(() => resumeListening(), 2000);
+    }
+  }, [resumeListening]);
+
+  // ── Mic press — one tap starts the session or interrupts speaking ──────────
+  const handleMicPress = useCallback(() => {
+    const { sessionActive, micState } = stateRef.current;
+    
+    // If AI is speaking, clicking the orb will cut it off and start listening
+    if (sessionActive && micState === 'speaking') {
+      cancelSpeaking();
+      resumeListening();
+      return;
+    }
+
+    // If currently listening, clicking the orb manually forces it to stop and process the audio
+    if (sessionActive && micState === 'listening') {
+      stopListening();
+      return;
+    }
+
+    if (sessionActive || micState !== 'idle') return;
+
+    setState((s) => ({ ...s, sessionActive: true, error: null }));
+    setMicState('listening');
+
+    startListening(
+      (transcript) => processTranscript(transcript),
+      (errMsg) => {
+        if (errMsg.includes('No speech detected')) {
+          resumeListening();
+        } else {
+          setError(errMsg);
+          setMicState('idle');
+        }
+      }
+    );
+  }, [processTranscript, resumeListening]);
+
+  // ── End session + score ───────────────────────────────────────────────────
+  const handleEndSession = useCallback(async () => {
+    const { messages, mode } = stateRef.current;
+    const modeConfig = MODES[mode];
+
+    stopListening();
+    cancelSpeaking();
+    setState((s) => ({ ...s, sessionActive: false }));
+
+    if (messages.length === 0) {
+      setState(initialState);
+      return;
+    }
+
+    setIsScoringLoading(true);
+    setMicState('thinking');
+
+    try {
+      const scoreCard = await scoreSession(messages, modeConfig.scoringPrompt);
+      const newSession: SavedSession = {
+        id: crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(),
+        timestamp: Date.now(),
+        fileName: stateRef.current.uploadedFileName,
+        mode: stateRef.current.mode,
+        scoreCard,
+        messages,
+      };
+      
+      setSavedSessions((prev) => {
+        const updated = [newSession, ...prev];
+        localStorage.setItem('persona_sessions', JSON.stringify(updated));
+        return updated;
+      });
+
+      setViewingFromHistory(false);
+      setState((s) => ({ ...s, scoreCard, sessionActive: false, micState: 'idle' }));
+    } catch (err) {
+      console.error(err);
+      setError('Failed to score session. Please try again.');
+      setMicState('idle');
+    } finally {
+      setIsScoringLoading(false);
+    }
+  }, []);
+
+  // ── New session ───────────────────────────────────────────────────────────
+  const handleNewSession = useCallback(() => {
+    stopListening();
+    cancelSpeaking();
+    setState((s) => ({
+      ...initialState,
+      mode: s.mode,
+      material: s.material,
+      concepts: s.concepts,
+      uploadedFileName: s.uploadedFileName,
+    }));
+  }, []);
+
+  const { mode, micState, concepts, coveredConcepts, shakyConcepts, isUploading, uploadedFileName, scoreCard, sessionActive, error, messages } = state;
+  const isProcessing = micState === 'thinking' || micState === 'speaking' || isScoringLoading;
+
+  return (
+    <main
+      className="relative min-h-screen flex flex-col items-center overflow-hidden"
+      style={{ background: '#0a0a0f' }}
+      onMouseMove={handleMouseMove}
+    >
+      {/* Background radial glow */}
+      <div
+        className="pointer-events-none absolute inset-0 transition-opacity duration-300"
+        style={{
+          background: `radial-gradient(800px circle at ${mousePos.x}px ${mousePos.y}px, rgba(124, 58, 237, 0.12), transparent 40%)`,
+        }}
+      />
+
+      {/* Live concept tracker — left side, only during active session */}
+      <ConceptTracker
+        concepts={concepts}
+        coveredConcepts={coveredConcepts}
+        shakyConcepts={shakyConcepts}
+        isSessionActive={sessionActive}
+      />
+
+      {/* Top: mode toggle + upload */}
+      <div className="relative z-10 flex flex-col items-center gap-4 pt-10 w-full px-6">
+        <span className="text-xs font-bold tracking-[0.3em] uppercase" style={{ color: 'rgba(255,255,255,0.25)' }}>
+          Persona
+        </span>
+
+        <ModeToggle
+          current={mode}
+          onChange={handleModeChange}
+          disabled={sessionActive || isProcessing}
+        />
+
+        <FileUpload
+          onExtracted={handleFileExtracted}
+          concepts={concepts}
+          isExtracting={isUploading}
+          uploadedFileName={uploadedFileName}
+          disabled={sessionActive || isProcessing}
+        />
+      </div>
+
+      {/* Center: Mic button */}
+      <div className="relative z-10 flex-1 flex flex-col items-center justify-center gap-6">
+        <MicButton
+          state={micState}
+          onPress={handleMicPress}
+        />
+
+        {/* State hints */}
+        {!sessionActive && micState === 'idle' && (
+          <motion.p
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="text-xs tracking-widest uppercase"
+            style={{ color: 'rgba(255,255,255,0.2)' }}
+          >
+            tap to begin
+          </motion.p>
+        )}
+
+        {/* Live Holographic Subtitles */}
+        <div className="h-20 flex items-center justify-center max-w-lg text-center px-4">
+          <AnimatePresence mode="wait">
+            {sessionActive && micState === 'speaking' && messages.length > 0 && messages[messages.length - 1].role === 'assistant' && (
+              <LiveSubtitle 
+                key={messages[messages.length - 1].timestamp} 
+                text={messages[messages.length - 1].content} 
+              />
+            )}
+            
+            {sessionActive && micState === 'listening' && (
+              <motion.p
+                key="listening-hint"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="text-xs tracking-widest uppercase animate-pulse"
+                style={{ color: 'rgba(16, 185, 129, 0.6)' }}
+              >
+                speak anytime (or tap orb to send)
+              </motion.p>
+            )}
+            
+            {sessionActive && micState === 'thinking' && (
+              <motion.p
+                key="thinking-hint"
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="text-xs tracking-widest uppercase animate-pulse"
+                style={{ color: 'rgba(245, 158, 11, 0.6)' }}
+              >
+                thinking...
+              </motion.p>
+            )}
+          </AnimatePresence>
+        </div>
+
+        {/* End session */}
+        {sessionActive && (
+          <button
+            id="end-session-btn"
+            onClick={handleEndSession}
+            disabled={isScoringLoading}
+            className="px-6 py-2.5 rounded-xl text-sm font-semibold transition-all duration-300 hover:scale-[1.02] active:scale-[0.98] disabled:opacity-40 disabled:cursor-not-allowed"
+            style={{
+              background: 'rgba(255,255,255,0.05)',
+              border: '1px solid rgba(255,255,255,0.1)',
+              color: 'rgba(255,255,255,0.5)',
+            }}
+          >
+            {isScoringLoading ? 'Scoring...' : 'End Session'}
+          </button>
+        )}
+
+        {/* Error */}
+        {error && (
+          <div
+            className="max-w-xs px-4 py-3 rounded-xl text-xs text-center"
+            style={{
+              background: 'rgba(239, 68, 68, 0.1)',
+              border: '1px solid rgba(239, 68, 68, 0.2)',
+              color: '#fca5a5',
+            }}
+          >
+            {error}
+          </div>
+        )}
+      </div>
+
+      {/* History toggle (Top Right) */}
+      {!sessionActive && !showHistory && (
+        <div className="fixed top-6 right-6 z-30">
+          <button
+            id="show-history-btn"
+            onClick={() => setShowHistory(true)}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all duration-300 hover:scale-[1.02]"
+            style={{
+              background: 'rgba(255,255,255,0.05)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              color: 'rgba(255,255,255,0.4)',
+              backdropFilter: 'blur(12px)',
+            }}
+          >
+            📊 History ({savedSessions.length})
+          </button>
+        </div>
+      )}
+
+      {/* Transcript toggle */}
+      {messages.length > 0 && !showTranscript && (
+        <div className="fixed bottom-6 right-6 z-30">
+          <button
+            id="show-transcript-btn"
+            onClick={() => setShowTranscript(true)}
+            className="flex items-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold transition-all duration-300 hover:scale-[1.02]"
+            style={{
+              background: 'rgba(255,255,255,0.05)',
+              border: '1px solid rgba(255,255,255,0.08)',
+              color: 'rgba(255,255,255,0.4)',
+              backdropFilter: 'blur(12px)',
+            }}
+          >
+            ≡ Transcript
+          </button>
+        </div>
+      )}
+
+      {showTranscript && (
+        <TranscriptPanel messages={messages} onClose={() => setShowTranscript(false)} />
+      )}
+
+      {showHistory && (
+        <HistoryPanel
+          sessions={savedSessions}
+          onClose={() => setShowHistory(false)}
+          onDeleteSession={handleDeleteSession}
+          onSelectSession={handleSelectSession}
+        />
+      )}
+
+      {scoreCard && (
+        <ScorecardOverlay 
+          scoreCard={scoreCard} 
+          onNewSession={() => {
+            setViewingFromHistory(false);
+            handleNewSession();
+          }} 
+          onClose={() => {
+            if (viewingFromHistory) {
+              setState((s) => ({ ...s, scoreCard: null }));
+              setShowHistory(true);
+              setViewingFromHistory(false);
+            } else {
+              handleNewSession();
+            }
+          }}
+        />
+      )}
+    </main>
+  );
+}
